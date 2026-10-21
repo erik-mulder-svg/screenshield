@@ -1,0 +1,61 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # NudeNet v3 "320n" detector, pinned to an exact file + checksum.
+      MODEL_URL: https://raw.githubusercontent.com/notAI-tech/NudeNet/6ccc81c6c305cccfd46d92b414f8a5c0a816574d/nudenet/320n.onnx
+      MODEL_SHA256: c15d8273adad2d0a92f014cc69ab2d6c311a06777a55545f2c4eb46f51911f0f
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Download detector model
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fsSL "$MODEL_URL" -o app/src/main/assets/320n.onnx
+          echo "$MODEL_SHA256  app/src/main/assets/320n.onnx" | sha256sum -c -
+
+      - name: Build release APK
+        run: gradle --no-daemon :app:assembleRelease
+
+      - name: Verify no internet permission
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
+          "$AAPT2" dump permissions "$APK" | tee perms.txt
+          if grep -qi "android.permission.INTERNET" perms.txt; then
+            echo "::error::APK requests INTERNET permission"; exit 1
+          fi
+          cp "$APK" "ScreenShield-${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenShield-${{ github.run_number }}
+          path: ScreenShield-${{ github.run_number }}.apk
+
+      - name: Publish as release (easy download on phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "ScreenShield-${{ github.run_number }}.apk" \
+            --title "ScreenShield build ${{ github.run_number }}" \
+            --notes "Built from ${{ github.sha }}. Download the .apk and install it." \
+            --latest

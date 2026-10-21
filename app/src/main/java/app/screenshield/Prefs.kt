@@ -1,0 +1,52 @@
+package app.screenshield
+
+import android.content.Context
+import android.content.SharedPreferences
+
+/** All user settings. Stored only in the app's private storage. */
+class Prefs(context: Context) {
+    private val sp: SharedPreferences =
+        context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
+
+    /** false = solid black boxes, true = blurred boxes. */
+    var blurMode: Boolean
+        get() = sp.getBoolean("blur", false)
+        set(v) = sp.edit().putBoolean("blur", v).apply()
+
+    /** How many times per second the screen is checked (1..15). */
+    var checksPerSecond: Int
+        get() = sp.getInt("cps", 5)
+        set(v) = sp.edit().putInt("cps", v.coerceIn(1, 15)).apply()
+
+    /** How long a box stays after the last sighting, in ms. Hides detector lag/flicker. */
+    var holdMs: Int
+        get() = sp.getInt("hold", 900)
+        set(v) = sp.edit().putInt("hold", v.coerceIn(200, 5000)).apply()
+
+    /** Extra margin added on every side of a detected area, in percent of its size. */
+    var enlargePct: Int
+        get() = sp.getInt("enlarge", 20)
+        set(v) = sp.edit().putInt("enlarge", v.coerceIn(0, 60)).apply()
+
+    /** Minimum detector confidence in percent. Lower = covers more (incl. false positives). */
+    var thresholdPct: Int
+        get() = sp.getInt("threshold", 30)
+        set(v) = sp.edit().putInt("threshold", v.coerceIn(15, 80)).apply()
+
+    /** Short side of the frame given to the detector, in pixels. */
+    var resolution: Int
+        get() = sp.getInt("res", 384)
+        set(v) = sp.edit().putInt("res", v).apply()
+
+    var coverMaleChest: Boolean
+        get() = sp.getBoolean("male_chest", false)
+        set(v) = sp.edit().putBoolean("male_chest", v).apply()
+
+    var batteryPromptShown: Boolean
+        get() = sp.getBoolean("battery_prompt", false)
+        set(v) = sp.edit().putBoolean("battery_prompt", v).apply()
+
+    companion object {
+        val RESOLUTIONS = intArrayOf(320, 384, 480, 640)
+    }
+}
