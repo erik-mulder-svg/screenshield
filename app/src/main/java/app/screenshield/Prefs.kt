@@ -8,10 +8,10 @@ class Prefs(context: Context) {
     private val sp: SharedPreferences =
         context.applicationContext.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
-    /** false = solid black boxes, true = blurred boxes. */
-    var blurMode: Boolean
-        get() = sp.getBoolean("blur", false)
-        set(v) = sp.edit().putBoolean("blur", v).apply()
+    /** false = solid black boxes, true = pixelated (mosaic) boxes. */
+    var pixelate: Boolean
+        get() = sp.getBoolean("pixelate", false)
+        set(v) = sp.edit().putBoolean("pixelate", v).apply()
 
     /** How many times per second the screen is checked (1..15). */
     var checksPerSecond: Int

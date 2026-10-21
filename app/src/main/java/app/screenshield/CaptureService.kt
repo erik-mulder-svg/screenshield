@@ -123,7 +123,7 @@ class CaptureService : Service() {
         }, main)
 
         prefs = Prefs(this)
-        overlay = OverlayManager(this, prefs.blurMode)
+        overlay = OverlayManager(this)
         instance = this
         lastError = null
 
@@ -153,7 +153,6 @@ class CaptureService : Service() {
 
     /** Called from the settings screen when something changed while running. */
     fun applySettings() {
-        main.post { if (!stopped) overlay.blur = prefs.blurMode }
         wh?.post { if (!stopped && prefs.resolution != curRes) setupDisplay() }
     }
 
@@ -235,7 +234,7 @@ class CaptureService : Service() {
         val dets = runDetector(det)
         val now = SystemClock.uptimeMillis()
         val p = params()
-        val toVerify = tracker.update(dets, grid, gridW, gridH, now, p, emptySet())
+        val toVerify = tracker.update(dets, grid, gridW, gridH, now, p, emptySet(), sampler)
         pushOverlay()
         if (toVerify.isNotEmpty()) verify(toVerify, det, p)
     }
@@ -252,7 +251,7 @@ class CaptureService : Service() {
         val ok = try { readImage(img) } finally { img.close() }
         if (!ok) return
         val dets = runDetector(det)
-        tracker.update(dets, grid, gridW, gridH, SystemClock.uptimeMillis(), p, ids)
+        tracker.update(dets, grid, gridW, gridH, SystemClock.uptimeMillis(), p, ids, sampler)
         pushOverlay()
     }
 
@@ -306,17 +305,54 @@ class CaptureService : Service() {
         return true
     }
 
+    /** Averages the current frame into a coarse mosaic (~7 blocks across the short side). */
+    private val sampler: (android.graphics.RectF) -> BoxTracker.Mosaic = { r ->
+        val x0 = r.left.toInt().coerceIn(0, vdW - 1)
+        val y0 = r.top.toInt().coerceIn(0, vdH - 1)
+        val x1 = r.right.toInt().coerceIn(x0 + 1, vdW)
+        val y1 = r.bottom.toInt().coerceIn(y0 + 1, vdH)
+        val bw = x1 - x0
+        val bh = y1 - y0
+        val block = max(3f, min(bw, bh) / 7f)
+        val cols = max(1, (bw / block).roundToInt())
+        val rows = max(1, (bh / block).roundToInt())
+        val area = vdW * vdH
+        val colors = IntArray(cols * rows)
+        for (cy in 0 until rows) for (cx in 0 until cols) {
+            val sx0 = x0 + bw * cx / cols; val sx1 = max(sx0 + 1, x0 + bw * (cx + 1) / cols)
+            val sy0 = y0 + bh * cy / rows; val sy1 = max(sy0 + 1, y0 + bh * (cy + 1) / rows)
+            var rs = 0f; var gs = 0f; var bs = 0f; var n = 0
+            var yy = sy0
+            while (yy < sy1) {
+                var xx = sx0
+                while (xx < sx1) {
+                    val i = yy * vdW + xx
+                    rs += floats[i]; gs += floats[area + i]; bs += floats[2 * area + i]; n++
+                    xx += 2
+                }
+                yy += 2
+            }
+            colors[cy * cols + cx] = android.graphics.Color.rgb(
+                (rs / n * 255).toInt(), (gs / n * 255).toInt(), (bs / n * 255).toInt(),
+            )
+        }
+        BoxTracker.Mosaic(colors, cols, rows)
+    }
+
     private fun pushOverlay() {
         val sx = screenW.toFloat() / vdW
         val sy = screenH.toFloat() / vdH
-        val map = HashMap<Int, Rect>()
+        val pixelate = prefs.pixelate
+        val map = HashMap<Int, OverlayManager.Visual>()
         for (b in tracker.boxes) {
-            map[b.id] = Rect(
+            val r = Rect(
                 floor(b.rect.left * sx).toInt(),
                 floor(b.rect.top * sy).toInt(),
                 ceil(b.rect.right * sx).toInt(),
                 ceil(b.rect.bottom * sy).toInt(),
             )
+            val m = if (pixelate) b.mosaic else null
+            map[b.id] = OverlayManager.Visual(r, m?.colors, m?.cols ?: 0, m?.rows ?: 0)
         }
         lastBoxCount = map.size
         main.post { if (!stopped) overlay.apply(map) }

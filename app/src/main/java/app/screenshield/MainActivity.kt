@@ -84,15 +84,14 @@ class MainActivity : Activity() {
         header(root, "Censor style")
         val group = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
         val black = RadioButton(this).apply { text = "Black boxes"; id = View.generateViewId() }
-        val blur = RadioButton(this).apply { text = "Blur"; id = View.generateViewId() }
-        group.addView(black); group.addView(blur)
-        group.check(if (prefs.blurMode) blur.id else black.id)
+        val pixel = RadioButton(this).apply { text = "Pixelated"; id = View.generateViewId() }
+        group.addView(black); group.addView(pixel)
+        group.check(if (prefs.pixelate) pixel.id else black.id)
         group.setOnCheckedChangeListener { _, checked ->
-            prefs.blurMode = checked == blur.id
-            CaptureService.instance?.applySettings()
+            prefs.pixelate = checked == pixel.id
         }
         root.addView(group)
-        note(root, "Blur uses Android's window blur. If the system turns blur off (e.g. power saving), grey boxes are used.")
+        note(root, "Pixelated shows a coarse mosaic of the covered area (it updates each time the detector sees it). Black is the most private.")
 
         // ---- Performance
         header(root, "Detection")

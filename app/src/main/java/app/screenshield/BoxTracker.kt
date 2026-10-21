@@ -19,7 +19,12 @@ import kotlin.math.abs
  */
 class BoxTracker {
 
-    class Box(val id: Int, var rect: RectF, var lastSeen: Long, var ref: IntArray)
+    class Box(val id: Int, var rect: RectF, var lastSeen: Long, var ref: IntArray) {
+        /** Pixelation colours, sampled from a frame where the content was really visible. */
+        var mosaic: Mosaic? = null
+    }
+
+    class Mosaic(val colors: IntArray, val cols: Int, val rows: Int)
 
     data class Params(
         val enlargeFrac: Float,
@@ -44,6 +49,7 @@ class BoxTracker {
         grid: IntArray, gw: Int, gh: Int,
         now: Long, p: Params,
         verifying: Set<Int>,
+        sample: ((RectF) -> Mosaic)? = null,
     ): Set<Int> {
         val matched = HashSet<Int>()
         for (d in dets) {
@@ -58,9 +64,11 @@ class BoxTracker {
                 best.rect = stabilise(best.rect, e)
                 best.lastSeen = now
                 best.ref = grid.copyOf()
+                if (sample != null) best.mosaic = sample(best.rect)
                 matched += best.id
             } else {
                 val nb = Box(nextId++, e, now, grid.copyOf())
+                if (sample != null) nb.mosaic = sample(e)
                 boxes += nb
                 matched += nb.id
             }
