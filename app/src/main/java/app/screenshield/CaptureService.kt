@@ -195,6 +195,7 @@ class CaptureService : Service() {
         grid = IntArray(gridW * gridH)
 
         tracker.clear()
+        highlights.clear()
         main.post { if (!stopped) overlay.clear() }
         Log.i(TAG, "capture ${w}x$h for screen ${screenW}x$screenH")
     }
@@ -255,15 +256,30 @@ class CaptureService : Service() {
         pushOverlay()
     }
 
+    /** Highlighted feet: simple hold-based tracking (they're never covered, so no peeking needed). */
+    private class Highlight(val id: Int, var rect: android.graphics.RectF, var lastSeen: Long)
+    private val highlights = ArrayList<Highlight>()
+    private var nextHighlightId = 1
+
+    /** Runs the model; returns the areas to censor and updates [highlights]. */
     private fun runDetector(det: Detector): List<android.graphics.RectF> {
         val t0 = SystemClock.uptimeMillis()
-        val res = det.detect(
-            tensor, vdW, vdH,
-            prefs.thresholdPct / 100f,
-            Detector.enabledClasses(prefs.coverMaleChest),
-        )
+        val highlight = prefs.highlightFeet
+        val enabled = Detector.enabledClasses(prefs.coverMaleChest)
+        if (highlight) enabled[Detector.FEET_EXPOSED] = true
+        val res = det.detect(tensor, vdW, vdH, prefs.thresholdPct / 100f, enabled)
         lastInferMs = SystemClock.uptimeMillis() - t0
-        return res.map { it.rect }
+
+        val now = SystemClock.uptimeMillis()
+        for (d in res) {
+            if (d.cls != Detector.FEET_EXPOSED) continue
+            val match = highlights.firstOrNull { android.graphics.RectF.intersects(it.rect, d.rect) }
+            if (match != null) { match.rect = android.graphics.RectF(d.rect); match.lastSeen = now }
+            else highlights += Highlight(nextHighlightId++, android.graphics.RectF(d.rect), now)
+        }
+        val hold = prefs.holdMs.toLong()
+        highlights.removeAll { !highlight || now - it.lastSeen > hold }
+        return res.filter { it.cls != Detector.FEET_EXPOSED }.map { it.rect }
     }
 
     /** Copies the frame into the model tensor + a coarse luma grid. The Image is closed by the caller. */
@@ -355,7 +371,14 @@ class CaptureService : Service() {
             map[b.id] = OverlayManager.Visual(r, m?.colors, m?.cols ?: 0, m?.rows ?: 0)
         }
         lastBoxCount = map.size
-        main.post { if (!stopped) overlay.apply(map) }
+        val hl = HashMap<Int, Rect>()
+        for (h in highlights) {
+            hl[h.id] = Rect(
+                floor(h.rect.left * sx).toInt(), floor(h.rect.top * sy).toInt(),
+                ceil(h.rect.right * sx).toInt(), ceil(h.rect.bottom * sy).toInt(),
+            )
+        }
+        main.post { if (!stopped) { overlay.apply(map); overlay.applyHighlights(hl) } }
     }
 
     private fun runOnMainAndWait(block: () -> Unit) {

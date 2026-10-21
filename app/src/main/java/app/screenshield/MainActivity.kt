@@ -126,6 +126,14 @@ class MainActivity : Activity() {
         }
         root.addView(male)
 
+        val feet = Switch(this).apply {
+            text = "Highlight bare feet (outline, not covered)"
+            isChecked = prefs.highlightFeet
+            setOnCheckedChangeListener { _, v -> prefs.highlightFeet = v }
+            setPadding(0, dp(12), 0, dp(12))
+        }
+        root.addView(feet)
+
         // ---- Privacy
         header(root, "Privacy")
         note(root, "This app has no internet permission. Screen frames exist only in memory for a moment and are never saved. " +

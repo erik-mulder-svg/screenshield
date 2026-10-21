@@ -42,6 +42,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("male_chest", false)
         set(v) = sp.edit().putBoolean("male_chest", v).apply()
 
+    /** Draw a bright outline around detected bare feet (never covered, just marked). */
+    var highlightFeet: Boolean
+        get() = sp.getBoolean("highlight_feet", true)
+        set(v) = sp.edit().putBoolean("highlight_feet", v).apply()
+
     var batteryPromptShown: Boolean
         get() = sp.getBoolean("battery_prompt", false)
         set(v) = sp.edit().putBoolean("battery_prompt", v).apply()

@@ -85,7 +85,7 @@ class Detector(context: Context) : AutoCloseable {
         val sorted = dets.sortedByDescending { it.score }
         val keep = ArrayList<Detection>()
         for (d in sorted) {
-            if (keep.none { iou(it.rect, d.rect) > iouThr }) keep += d
+            if (keep.none { it.cls == d.cls && iou(it.rect, d.rect) > iouThr }) keep += d
             if (keep.size >= 30) break
         }
         return keep
@@ -125,5 +125,7 @@ class Detector(context: Context) : AutoCloseable {
             if (coverMaleChest) e[LABELS.indexOf("MALE_BREAST_EXPOSED")] = true
             return e
         }
+
+        val FEET_EXPOSED = LABELS.indexOf("FEET_EXPOSED")
     }
 }
