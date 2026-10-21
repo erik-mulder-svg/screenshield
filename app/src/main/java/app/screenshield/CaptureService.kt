@@ -449,7 +449,7 @@ class CaptureService : Service() {
                 t.quitSafely()
             }
         }
-        if (::overlay.isInitialized) overlay.release()
+        if (::overlay.isInitialized) overlay.clear()
         try { projection?.stop() } catch (_: Throwable) {}
         projection = null
         lastBoxCount = 0
