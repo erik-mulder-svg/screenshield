@@ -126,13 +126,43 @@ class MainActivity : Activity() {
         }
         root.addView(male)
 
-        val feet = Switch(this).apply {
-            text = "Highlight bare feet (outline, not covered)"
+        // ---- Scrolling
+        header(root, "Scrolling & censor check")
+        root.addView(Switch(this).apply {
+            text = "Block below women's faces until checked"
+            isChecked = prefs.preBlockFaces
+            setOnCheckedChangeListener { _, v -> prefs.preBlockFaces = v }
+            setPadding(0, dp(12), 0, dp(4))
+        })
+        note(root, "When a woman's face appears, anything below it that hasn't been analysed yet shows a " +
+            "\"Censor check…\" block. When you slow down or stop, it is checked, nudity is censored and the block disappears.")
+        val gGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val gThrough = RadioButton(this).apply { text = "Touch-through block (you can scroll on it)"; id = View.generateViewId() }
+        val gSolid = RadioButton(this).apply { text = "Solid block (fully opaque, but blocks touches there)"; id = View.generateViewId() }
+        gGroup.addView(gThrough); gGroup.addView(gSolid)
+        gGroup.check(if (prefs.guardTouchThrough) gThrough.id else gSolid.id)
+        gGroup.setOnCheckedChangeListener { _, c -> prefs.guardTouchThrough = c == gThrough.id }
+        root.addView(gGroup)
+        note(root, "Android limits touch-through overlays to 80% opacity, so a dark noise pattern is used to hide what's behind it.")
+        root.addView(Switch(this).apply {
+            text = "Faster checks while scrolling (up to 12/s)"
+            isChecked = prefs.boostWhileScrolling
+            setOnCheckedChangeListener { _, v -> prefs.boostWhileScrolling = v }
+            setPadding(0, dp(12), 0, dp(12))
+        })
+
+        // ---- Feet
+        header(root, "Feet")
+        root.addView(Switch(this).apply {
+            text = "Highlight bare feet (neon outline, not covered)"
             isChecked = prefs.highlightFeet
             setOnCheckedChangeListener { _, v -> prefs.highlightFeet = v }
-            setPadding(0, dp(12), 0, dp(12))
+            setPadding(0, dp(12), 0, dp(4))
+        })
+        slider(root, "Feet sensitivity", 8, 60, prefs.feetThresholdPct, { "$it %" }) {
+            prefs.feetThresholdPct = it
         }
-        root.addView(feet)
+        note(root, "Lower = also catches soles and partly visible feet, but may outline other things.")
 
         // ---- Privacy
         header(root, "Privacy")
@@ -161,7 +191,10 @@ class MainActivity : Activity() {
         val on = CaptureService.running
         val sb = StringBuilder()
         sb.append(if (on) "● Protection is ON" else "○ Protection is off")
-        if (on) sb.append("\nLast check took ${CaptureService.lastInferMs} ms · ${CaptureService.lastBoxCount} box(es)")
+        if (on) {
+            sb.append("\nLast check took ${CaptureService.lastInferMs} ms · ${CaptureService.lastBoxCount} box(es)")
+            if (CaptureService.lastGuardCount > 0) sb.append(" · ${CaptureService.lastGuardCount} check(s) pending")
+        }
         CaptureService.lastError?.let { if (!on) sb.append("\n").append(it) }
         status.text = sb
         toggle.text = if (on) "Turn off" else "Turn on"

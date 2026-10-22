@@ -22,6 +22,8 @@ class BoxTracker {
     class Box(val id: Int, var rect: RectF, var lastSeen: Long, var ref: IntArray) {
         /** Pixelation colours, sampled from a frame where the content was really visible. */
         var mosaic: Mosaic? = null
+        /** Rows (grid cells) the content has scrolled since [ref] was taken. */
+        var refShift: Float = 0f
     }
 
     class Mosaic(val colors: IntArray, val cols: Int, val rows: Int)
@@ -38,6 +40,19 @@ class BoxTracker {
     private var nextId = 1
 
     fun clear() = boxes.clear()
+
+    /** Content scrolled by [cells] grid rows: move every box along with it. */
+    fun shift(cells: Float, cell: Int, frameH: Int) {
+        if (cells == 0f) return
+        val dy = cells * cell
+        val it = boxes.iterator()
+        while (it.hasNext()) {
+            val b = it.next()
+            b.rect.offset(0f, dy)
+            b.refShift += cells
+            if (b.rect.bottom <= 0f || b.rect.top >= frameH) it.remove()   // scrolled off screen
+        }
+    }
 
     /**
      * @param verifying ids of boxes that were hidden for this frame; if they are not
@@ -64,6 +79,7 @@ class BoxTracker {
                 best.rect = stabilise(best.rect, e)
                 best.lastSeen = now
                 best.ref = grid.copyOf()
+                best.refShift = 0f
                 if (sample != null) best.mosaic = sample(best.rect)
                 matched += best.id
             } else {
@@ -142,6 +158,7 @@ class BoxTracker {
     private fun surroundingsChanged(b: Box, grid: IntArray, gw: Int, gh: Int, p: Params): Boolean {
         if (b.ref.size != grid.size) return true
         val c = p.cell
+        val rs = Math.round(b.refShift)
         val ix0 = (b.rect.left / c).toInt(); val iy0 = (b.rect.top / c).toInt()
         val ix1 = (b.rect.right / c).toInt(); val iy1 = (b.rect.bottom / c).toInt()
         val mx = maxOf(3, (ix1 - ix0) / 3); val my = maxOf(3, (iy1 - iy0) / 3)
@@ -154,8 +171,9 @@ class BoxTracker {
             if (gx in ix0..ix1 && gy in iy0..iy1) continue
             val px = gx * c + c / 2f; val py = gy * c + c / 2f
             if (coveredByAnyBox(px, py)) continue
-            val i = gy * gw + gx
-            sum += abs(grid[i] - b.ref[i]); n++
+            val ry = gy - rs
+            if (ry !in 0 until gh) continue
+            sum += abs(grid[gy * gw + gx] - b.ref[ry * gw + gx]); n++
         }
         if (n < MIN_CELLS) {
             // Box (almost) fills the screen: fall back to everything that is visible.
@@ -163,8 +181,9 @@ class BoxTracker {
             for (gy in 0 until gh) for (gx in 0 until gw) {
                 val px = gx * c + c / 2f; val py = gy * c + c / 2f
                 if (coveredByAnyBox(px, py)) continue
-                val i = gy * gw + gx
-                sum += abs(grid[i] - b.ref[i]); n++
+                val ry = gy - rs
+                if (ry !in 0 until gh) continue
+                sum += abs(grid[gy * gw + gx] - b.ref[ry * gw + gx]); n++
             }
             if (n < MIN_CELLS) return true   // nothing to compare with: verify periodically
         }

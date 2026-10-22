@@ -1,184 +1,153 @@
 package app.screenshield
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
+import android.graphics.Typeface
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import kotlin.random.Random
 
 /**
- * One small overlay window per censor box ("display over other apps").
- *
- * The windows are deliberately TOUCHABLE: since Android 12 the system forces
- * click-through (FLAG_NOT_TOUCHABLE) overlays to max 80% opacity, which made
- * the boxes see-through. A touchable window stays 100% opaque; touches on the
- * box itself are swallowed, touches elsewhere go to the app below.
+ * All overlay windows ("display over other apps"):
+ *  - BOX: censor boxes. Touchable, so Android keeps them 100% opaque
+ *    (click-through overlays are capped at 80% opacity since Android 12).
+ *  - GUARD: "censor check" blocks below faces. Either solid (opaque, swallows
+ *    touches) or touch-through (lets you scroll, but max 80% opaque).
+ *  - HIGHLIGHT: neon outline around bare feet. Click-through, transparent inside.
  *
  * Must only be used on the main thread.
  */
 class OverlayManager(private val context: Context) {
 
-    companion object {
-        private const val HL_PAD = 24
-    }
+    enum class Kind { BOX, GUARD, HIGHLIGHT }
 
-    /** What to draw for one box. [colors] is a cols x rows mosaic, or null for solid black. */
+    /** What to draw for one censor box. [colors] is a cols x rows mosaic, or null for solid black. */
     class Visual(val rect: Rect, val colors: IntArray?, val cols: Int, val rows: Int)
 
+    private class Entry(val view: View, var rect: Rect, var touchThrough: Boolean)
+
     private val wm = context.getSystemService(WindowManager::class.java)
-    private val views = HashMap<Int, BoxView>()
-    private val highlightViews = HashMap<Int, HighlightView>()
-    private val highlightRects = HashMap<Int, Rect>()
+    private val density = context.resources.displayMetrics.density
+    private val entries = HashMap<Long, Entry>()
 
-    /** Bright outlines around highlighted areas. These windows are click-through and transparent inside. */
-    fun applyHighlights(areas: Map<Int, Rect>) {
-        for (id in highlightViews.keys.filter { it !in areas }) removeHighlight(id)
-        for ((id, r) in areas) {
-            val padded = Rect(r).apply { inset(-HL_PAD, -HL_PAD) }
-            val existing = highlightViews[id]
-            if (existing == null) {
-                val v = HighlightView(context)
-                try {
-                    wm.addView(v, highlightParams(padded))
-                    highlightViews[id] = v
-                    highlightRects[id] = padded
-                } catch (_: Throwable) {
-                }
-            } else if (highlightRects[id] != padded) {
-                try { wm.updateViewLayout(existing, highlightParams(padded)) } catch (_: Throwable) {}
-                highlightRects[id] = padded
-            }
-        }
-    }
+    private fun key(kind: Kind, id: Int): Long = (kind.ordinal.toLong() shl 32) or (id.toLong() and 0xFFFFFFFFL)
+    private fun kindOf(key: Long): Int = (key ushr 32).toInt()
 
-    private fun removeHighlight(id: Int) {
-        highlightViews.remove(id)?.let { try { wm.removeViewImmediate(it) } catch (_: Throwable) {} }
-        highlightRects.remove(id)
-    }
+    // ------------------------------------------------------------------ public API
 
-    private fun highlightParams(r: Rect): WindowManager.LayoutParams {
-        val lp = WindowManager.LayoutParams(
-            r.width().coerceAtLeast(1),
-            r.height().coerceAtLeast(1),
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            PixelFormat.TRANSLUCENT,
-        )
-        lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = r.left
-        lp.y = r.top
-        lp.windowAnimations = 0
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        lp.fitInsetsTypes = 0
-        lp.fitInsetsSides = 0
-        lp.title = "ScreenShield highlight"
-        return lp
-    }
-
-    /** Thick neon outline with corner brackets; interior stays fully visible. */
-    private class HighlightView(context: Context) : View(context) {
-        private val d = context.resources.displayMetrics.density
-        private val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE; strokeWidth = 9 * d; color = 0x66FF2D95
-        }
-        private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE; strokeWidth = 3.5f * d; color = 0xFFFF2D95.toInt()
-        }
-        private val corner = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE; strokeWidth = 6 * d; color = 0xFFFFE14D.toInt()
-            strokeCap = Paint.Cap.ROUND
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val i = 6 * d
-            val l = i; val t = i; val r = width - i; val b = height - i
-            val rad = 14 * d
-            canvas.drawRoundRect(l, t, r, b, rad, rad, glow)
-            canvas.drawRoundRect(l, t, r, b, rad, rad, line)
-            val c = minOf(r - l, b - t) * 0.22f
-            canvas.drawLine(l, t, l + c, t, corner); canvas.drawLine(l, t, l, t + c, corner)
-            canvas.drawLine(r, t, r - c, t, corner); canvas.drawLine(r, t, r, t + c, corner)
-            canvas.drawLine(l, b, l + c, b, corner); canvas.drawLine(l, b, l, b - c, corner)
-            canvas.drawLine(r, b, r - c, b, corner); canvas.drawLine(r, b, r, b - c, corner)
-        }
-    }
-
-    fun apply(boxes: Map<Int, Visual>) {
-        for (id in views.keys.filter { it !in boxes }) remove(id)
+    fun applyBoxes(boxes: Map<Int, Visual>) {
+        sync(Kind.BOX, boxes.keys)
         for ((id, v) in boxes) {
-            val view = views[id]
-            if (view == null) {
-                val nv = BoxView(context)
-                nv.setVisual(v)
-                try {
-                    wm.addView(nv, params(v.rect))
-                    views[id] = nv
-                } catch (_: Throwable) {
-                }
-            } else {
-                if (view.rect != v.rect) {
-                    try { wm.updateViewLayout(view, params(v.rect)) } catch (_: Throwable) {}
-                }
-                view.setVisual(v)
-                view.visibility = View.VISIBLE
-            }
+            val view = place(Kind.BOX, id, v.rect, touchThrough = false) { BoxView(context) } as BoxView
+            view.setVisual(v)
         }
     }
 
-    fun setHidden(ids: Set<Int>, hidden: Boolean) {
-        for (id in ids) views[id]?.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
+    fun applyGuards(guards: Map<Int, Rect>, touchThrough: Boolean) {
+        sync(Kind.GUARD, guards.keys)
+        for ((id, r) in guards) {
+            val k = key(Kind.GUARD, id)
+            val e = entries[k]
+            if (e != null && e.touchThrough != touchThrough) remove(k)   // style changed: recreate
+            place(Kind.GUARD, id, r, touchThrough) { GuardView(context) }
+        }
+    }
+
+    fun applyHighlights(areas: Map<Int, Rect>) {
+        sync(Kind.HIGHLIGHT, areas.keys)
+        val pad = (HL_PAD_DP * density).toInt()
+        for ((id, r) in areas) {
+            val padded = Rect(r).apply { inset(-pad, -pad) }
+            place(Kind.HIGHLIGHT, id, padded, touchThrough = true) { HighlightView(context) }
+        }
+    }
+
+    fun setHidden(kind: Kind, ids: Set<Int>, hidden: Boolean) {
+        for (id in ids) entries[key(kind, id)]?.view?.visibility = if (hidden) View.INVISIBLE else View.VISIBLE
     }
 
     fun clear() {
-        for (id in views.keys.toList()) remove(id)
-        for (id in highlightViews.keys.toList()) removeHighlight(id)
+        for (k in entries.keys.toList()) remove(k)
     }
 
-    private fun remove(id: Int) {
-        views.remove(id)?.let { try { wm.removeViewImmediate(it) } catch (_: Throwable) {} }
+    // ------------------------------------------------------------------ window plumbing
+
+    private fun sync(kind: Kind, keep: Set<Int>) {
+        for (k in entries.keys.toList()) {
+            if (kindOf(k) == kind.ordinal && (k and 0xFFFFFFFFL).toInt() !in keep) remove(k)
+        }
     }
 
-    private fun params(r: Rect): WindowManager.LayoutParams {
+    private fun place(kind: Kind, id: Int, r: Rect, touchThrough: Boolean, make: () -> View): View {
+        val k = key(kind, id)
+        val e = entries[k]
+        if (e == null) {
+            val v = make()
+            try {
+                wm.addView(v, params(r, touchThrough, kind.name))
+                entries[k] = Entry(v, Rect(r), touchThrough)
+            } catch (_: Throwable) {
+            }
+            return v
+        }
+        if (e.rect != r) {
+            try { wm.updateViewLayout(e.view, params(r, touchThrough, kind.name)) } catch (_: Throwable) {}
+            e.rect = Rect(r)
+        }
+        e.view.visibility = View.VISIBLE
+        return e.view
+    }
+
+    private fun remove(k: Long) {
+        entries.remove(k)?.let { try { wm.removeViewImmediate(it.view) } catch (_: Throwable) {} }
+    }
+
+    private fun params(r: Rect, touchThrough: Boolean, title: String): WindowManager.LayoutParams {
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+        flags = flags or if (touchThrough) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        else WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         val lp = WindowManager.LayoutParams(
             r.width().coerceAtLeast(1),
             r.height().coerceAtLeast(1),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            PixelFormat.OPAQUE,
+            flags,
+            if (touchThrough) PixelFormat.TRANSLUCENT else PixelFormat.OPAQUE,
         )
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = r.left
         lp.y = r.top
-        lp.alpha = 1f
+        // Android caps click-through overlays at 80% opacity; ask for exactly that.
+        lp.alpha = if (touchThrough) 0.8f else 1f
         lp.windowAnimations = 0
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         lp.fitInsetsTypes = 0
         lp.fitInsetsSides = 0
-        lp.title = "ScreenShield box"
+        lp.title = "ScreenShield $title"
         return lp
     }
 
+    // ------------------------------------------------------------------ views
+
     private class BoxView(context: Context) : View(context) {
-        var rect = Rect()
         private var colors: IntArray? = null
         private var cols = 0
         private var rows = 0
         private val paint = Paint().apply { isAntiAlias = false }
 
         fun setVisual(v: Visual) {
-            rect = Rect(v.rect)
             if (colors !== v.colors) {
                 colors = v.colors; cols = v.cols; rows = v.rows
                 invalidate()
@@ -202,5 +171,86 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
+    }
+
+    /** Dark, busy noise texture (hard to see through even at 80%) with a "Censor check" label. */
+    private class GuardView(context: Context) : View(context) {
+        private val d = context.resources.displayMetrics.density
+        private val noise = Paint().apply {
+            shader = BitmapShader(noiseTile(), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT).apply {
+                setLocalMatrix(Matrix().apply { setScale(3f * d, 3f * d) })
+            }
+            isFilterBitmap = false
+        }
+        private val pill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xF0101018.toInt() }
+        private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 13 * d
+            typeface = Typeface.DEFAULT_BOLD
+            textAlign = Paint.Align.CENTER
+        }
+        private val label = "Censor check…"
+
+        override fun onDraw(canvas: Canvas) {
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), noise)
+            if (height < 30 * d || width < 120 * d) return
+            val tw = text.measureText(label) + 24 * d
+            val cx = width / 2f
+            val cy = minOf(height / 2f, 28 * d)
+            val r = RectF(cx - tw / 2, cy - 14 * d, cx + tw / 2, cy + 14 * d)
+            canvas.drawRoundRect(r, 14 * d, 14 * d, pill)
+            canvas.drawText(label, cx, cy + 4.5f * d, text)
+        }
+
+        companion object {
+            private fun noiseTile(): Bitmap {
+                val n = 48
+                val px = IntArray(n * n)
+                val rnd = Random(7)
+                for (i in px.indices) {
+                    val v = if (rnd.nextFloat() < 0.5f) rnd.nextInt(0, 40) else rnd.nextInt(90, 200)
+                    px[i] = Color.rgb(v, v, (v * 1.1f).toInt().coerceAtMost(255))
+                }
+                return Bitmap.createBitmap(px, n, n, Bitmap.Config.ARGB_8888)
+            }
+        }
+    }
+
+    /** Neon pink tube with a soft glow; interior stays fully visible. */
+    private class HighlightView(context: Context) : View(context) {
+        private val d = context.resources.displayMetrics.density
+        private val glowLayers = listOf(
+            18f to 0x14, 13f to 0x24, 9f to 0x40, 6f to 0x70,
+        ).map { (w, a) ->
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = w * d
+                color = (a shl 24) or NEON
+                strokeJoin = Paint.Join.ROUND
+            }
+        }
+        private val tube = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeWidth = 3f * d; color = 0xFF000000.toInt() or NEON
+        }
+        private val core = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeWidth = 1.2f * d; color = 0xFFFFC8F4.toInt()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val i = HL_PAD_DP * d * 0.55f
+            val r = RectF(i, i, width - i, height - i)
+            val rad = 16 * d
+            for (p in glowLayers) canvas.drawRoundRect(r, rad, rad, p)
+            canvas.drawRoundRect(r, rad, rad, tube)
+            canvas.drawRoundRect(r, rad, rad, core)
+        }
+
+        companion object {
+            private const val NEON = 0xFF1FCE   // neon pink, RGB only
+        }
+    }
+
+    companion object {
+        private const val HL_PAD_DP = 16f
     }
 }

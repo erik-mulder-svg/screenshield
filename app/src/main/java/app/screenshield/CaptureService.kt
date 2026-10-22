@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -33,6 +34,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -54,13 +56,15 @@ class CaptureService : Service() {
         private const val CHANNEL = "protection"
         private const val NOTIF_ID = 1
         private const val CELL = 4              // luma grid cell size in capture pixels
-        private const val PEEK_MS = 60L         // how long a box is lifted to look underneath
+        private const val FACE_THRESHOLD = 0.35f
 
         @Volatile var instance: CaptureService? = null
             private set
         val running: Boolean get() = instance != null
         @Volatile var lastInferMs: Long = 0
         @Volatile var lastBoxCount: Int = 0
+        @Volatile var lastGuardCount: Int = 0
+        @Volatile var lastScrollPxPerS: Float = 0f
         @Volatile var lastError: String? = null
     }
 
@@ -169,7 +173,7 @@ class CaptureService : Service() {
         val h = roundTo32(screenH * scale)
         val dpi = max(1, (resources.displayMetrics.densityDpi * scale).roundToInt())
 
-        val newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        val newReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
         val existing = vd
         if (existing == null) {
             vd = p.createVirtualDisplay(
@@ -196,6 +200,10 @@ class CaptureService : Service() {
 
         tracker.clear()
         highlights.clear()
+        guards.clear()
+        scroll.reset()
+        shownRects = emptyList()
+        velocity = 0f
         main.post { if (!stopped) overlay.clear() }
         Log.i(TAG, "capture ${w}x$h for screen ${screenW}x$screenH")
     }
@@ -203,6 +211,23 @@ class CaptureService : Service() {
     private fun roundTo32(v: Float): Int = max(32, ((v + 16f) / 32f).toInt() * 32)
 
     // ---------------------------------------------------------------- main loop
+
+    private val scroll = ScrollEstimator()
+    private val guards = FaceGuards()
+    private var ownMask = BooleanArray(0)
+    /** Rects (capture px) of our opaque windows as last shown; excluded from scroll matching. */
+    private var shownRects: List<RectF> = emptyList()
+    /** Scroll velocity in grid rows per ms (negative = content moving up). */
+    private var velocity = 0f
+    private var lastFrameNs = 0L
+    private var lastFrameUptime = 0L
+    private var lastMotionUptime = 0L
+    private var lastGuardPeek = 0L
+
+    private fun effectiveIntervalMs(now: Long): Long {
+        val base = 1000L / prefs.checksPerSecond.coerceIn(1, 15)
+        return if (prefs.boostWhileScrolling && now - lastMotionUptime < 800) min(base, 1000L / 12) else base
+    }
 
     private val tick: Runnable = Runnable {
         if (stopped) return@Runnable
@@ -213,7 +238,7 @@ class CaptureService : Service() {
             Log.e(TAG, "frame failed", t)
             lastError = t.toString()
         }
-        val interval = 1000L / prefs.checksPerSecond.coerceIn(1, 15)
+        val interval = effectiveIntervalMs(SystemClock.uptimeMillis())
         val elapsed = SystemClock.uptimeMillis() - start
         wh?.postDelayed(tick, max(5L, interval - elapsed))
     }
@@ -227,59 +252,172 @@ class CaptureService : Service() {
     private fun processFrame() {
         val r = reader ?: return
         val det = detector ?: return
-        // null = nothing on screen changed since the last check -> boxes stay as they are.
-        val img = r.acquireLatestImage() ?: return
+        val now = SystemClock.uptimeMillis()
+        // null = nothing on screen changed since the last check.
+        val img = r.acquireLatestImage()
+        if (img == null) {
+            if (velocity != 0f && now - lastFrameUptime > 150) {
+                velocity = 0f            // scrolling stopped: drop the motion smear
+                pushOverlay(lastFrameNs)
+            }
+            maybePeekGuards(det, now)
+            return
+        }
+        val ts = frameTimeNs(img)
         val ok = try { readImage(img) } finally { img.close() }
         if (!ok) return
 
-        val dets = runDetector(det)
-        val now = SystemClock.uptimeMillis()
+        val kind = trackMotion(ts)
+        val res = runDetector(det)
         val p = params()
-        val toVerify = tracker.update(dets, grid, gridW, gridH, now, p, emptySet(), sampler)
-        pushOverlay()
-        if (toVerify.isNotEmpty()) verify(toVerify, det, p)
+        val toVerify = tracker.update(res.censor, grid, gridW, gridH, now, p, emptySet(), sampler)
+        if (prefs.preBlockFaces) {
+            guards.update(res.faces, now, vdW, vdH, kind == ScrollEstimator.Kind.CHANGED, p.holdMs)
+        } else {
+            guards.clear()
+        }
+        pushOverlay(ts)
+        if (toVerify.isNotEmpty()) peek(det, toVerify, emptySet())
+        else maybePeekGuards(det, SystemClock.uptimeMillis())
     }
 
-    /** Lift the given boxes for a moment, capture what's underneath, and keep only real ones. */
-    private fun verify(ids: Set<Int>, det: Detector, p: BoxTracker.Params) {
+    /** Lift "censor check" blocks for a moment to analyse what's under them, once scrolling slows. */
+    private fun maybePeekGuards(det: Detector, now: Long) {
+        if (!prefs.preBlockFaces || guards.guards.isEmpty()) return
+        if (now - lastGuardPeek < 250) return
+        val speed = abs(velocity) * CELL * (screenH.toFloat() / vdH) * 1000f   // screen px/s
+        val ids = HashSet<Int>()
+        for (g in guards.guards) {
+            if (guards.blockRect(g, vdW, vdH).isEmpty) continue
+            val waited = g.blockingSince != 0L && now - g.blockingSince > 1200
+            if (speed < 250f || waited) ids += g.id
+        }
+        if (ids.isEmpty()) return
+        lastGuardPeek = now
+        peek(det, emptySet(), ids)
+    }
+
+    /**
+     * Hide the given boxes/guards just long enough for ONE clean frame to be captured,
+     * then analyse that frame. Boxes that aren't re-detected disappear; guarded areas
+     * become "checked" and any nudity found there is boxed.
+     */
+    private fun peek(det: Detector, boxIds: Set<Int>, guardIds: Set<Int>) {
         val r = reader ?: return
-        runOnMainAndWait { overlay.setHidden(ids, true) }
-        SystemClock.sleep(PEEK_MS)
-        var img: Image? = r.acquireLatestImage()
-        if (img == null) { SystemClock.sleep(30); img = r.acquireLatestImage() }
-        main.post { if (!stopped) overlay.setHidden(ids, false) }
+        runOnMainAndWait {
+            overlay.setHidden(OverlayManager.Kind.BOX, boxIds, true)
+            overlay.setHidden(OverlayManager.Kind.GUARD, guardIds, true)
+        }
+        val img = waitForFreshImage(r, System.nanoTime())
+        main.post {
+            if (!stopped) {
+                overlay.setHidden(OverlayManager.Kind.BOX, boxIds, false)
+                overlay.setHidden(OverlayManager.Kind.GUARD, guardIds, false)
+            }
+        }
         if (img == null) return
+        val ts = frameTimeNs(img)
         val ok = try { readImage(img) } finally { img.close() }
         if (!ok) return
-        val dets = runDetector(det)
-        tracker.update(dets, grid, gridW, gridH, SystemClock.uptimeMillis(), p, ids, sampler)
-        pushOverlay()
+        val kind = trackMotion(ts)
+        val res = runDetector(det)
+        val now = SystemClock.uptimeMillis()
+        val p = params()
+        tracker.update(res.censor, grid, gridW, gridH, now, p, boxIds, sampler)
+        if (prefs.preBlockFaces) {
+            if (guardIds.isNotEmpty()) guards.markAnalysed(guardIds, vdH)
+            guards.update(res.faces, now, vdW, vdH, kind == ScrollEstimator.Kind.CHANGED, p.holdMs)
+        }
+        pushOverlay(ts)
+    }
+
+    /** Waits for the first frame composed after our windows were hidden (usually 15–35 ms). */
+    private fun waitForFreshImage(r: ImageReader, hideNs: Long): Image? {
+        val deadline = SystemClock.uptimeMillis() + 120
+        var cand: Image? = null
+        var seen = 0
+        while (SystemClock.uptimeMillis() < deadline) {
+            SystemClock.sleep(4)
+            val img = try { r.acquireLatestImage() } catch (_: Throwable) { null } ?: continue
+            seen++
+            cand?.close()
+            cand = img
+            val ts = img.timestamp
+            val plausible = abs(ts - System.nanoTime()) < 1_000_000_000L
+            if ((plausible && ts >= hideNs + 18_000_000L) || (!plausible && seen >= 2)) return img
+        }
+        return cand
+    }
+
+    private fun frameTimeNs(img: Image): Long {
+        val ts = img.timestamp
+        return if (abs(ts - System.nanoTime()) < 2_000_000_000L) ts else System.nanoTime()
+    }
+
+    /** Measures scrolling since the previous frame and moves everything along with the content. */
+    private fun trackMotion(ts: Long): ScrollEstimator.Kind {
+        if (ownMask.size != grid.size) ownMask = BooleanArray(grid.size)
+        ownMask.fill(false)
+        for (rc in shownRects) {
+            val x0 = (rc.left / CELL).toInt().coerceAtLeast(0)
+            val x1 = (rc.right / CELL).toInt().coerceAtMost(gridW - 1)
+            val y0 = (rc.top / CELL).toInt().coerceAtLeast(0)
+            val y1 = (rc.bottom / CELL).toInt().coerceAtMost(gridH - 1)
+            for (y in y0..y1) for (x in x0..x1) ownMask[y * gridW + x] = true
+        }
+        val m = scroll.estimate(grid, ownMask, gridW, gridH)
+        val dtMs = ((ts - lastFrameNs) / 1_000_000f).coerceIn(1f, 1000f)
+        val now = SystemClock.uptimeMillis()
+        when (m.kind) {
+            ScrollEstimator.Kind.SCROLL -> {
+                tracker.shift(m.shiftCells, CELL, vdH)
+                guards.shift(m.shiftCells, CELL)
+                val dy = m.shiftCells * CELL
+                for (h in highlights) h.rect.offset(0f, dy)
+                val v = m.shiftCells / dtMs
+                velocity = if (velocity != 0f && (velocity > 0) == (v > 0)) 0.4f * velocity + 0.6f * v else v
+                lastMotionUptime = now
+            }
+            else -> velocity = 0f
+        }
+        lastFrameNs = ts
+        lastFrameUptime = now
+        lastScrollPxPerS = abs(velocity) * CELL * (screenH.toFloat() / max(1, vdH)) * 1000f
+        return m.kind
     }
 
     /** Highlighted feet: simple hold-based tracking (they're never covered, so no peeking needed). */
-    private class Highlight(val id: Int, var rect: android.graphics.RectF, var lastSeen: Long)
+    private class Highlight(val id: Int, var rect: RectF, var lastSeen: Long)
     private val highlights = ArrayList<Highlight>()
     private var nextHighlightId = 1
 
-    /** Runs the model; returns the areas to censor and updates [highlights]. */
-    private fun runDetector(det: Detector): List<android.graphics.RectF> {
+    private class DetectResult(val censor: List<RectF>, val faces: List<RectF>)
+
+    /** Runs the model once; splits results into censor areas and female faces, and updates [highlights]. */
+    private fun runDetector(det: Detector): DetectResult {
         val t0 = SystemClock.uptimeMillis()
         val highlight = prefs.highlightFeet
+        val preBlock = prefs.preBlockFaces
         val enabled = Detector.enabledClasses(prefs.coverMaleChest)
-        if (highlight) enabled[Detector.FEET_EXPOSED] = true
-        val res = det.detect(tensor, vdW, vdH, prefs.thresholdPct / 100f, enabled)
+        val own = FloatArray(Detector.LABELS.size)
+        if (highlight) own[Detector.FEET_EXPOSED] = prefs.feetThresholdPct / 100f
+        if (preBlock) own[Detector.FACE_FEMALE] = FACE_THRESHOLD
+        val res = det.detect(tensor, vdW, vdH, prefs.thresholdPct / 100f, enabled, own)
         lastInferMs = SystemClock.uptimeMillis() - t0
 
         val now = SystemClock.uptimeMillis()
         for (d in res) {
             if (d.cls != Detector.FEET_EXPOSED) continue
-            val match = highlights.firstOrNull { android.graphics.RectF.intersects(it.rect, d.rect) }
-            if (match != null) { match.rect = android.graphics.RectF(d.rect); match.lastSeen = now }
-            else highlights += Highlight(nextHighlightId++, android.graphics.RectF(d.rect), now)
+            val match = highlights.firstOrNull { RectF.intersects(it.rect, d.rect) }
+            if (match != null) { match.rect = RectF(d.rect); match.lastSeen = now }
+            else highlights += Highlight(nextHighlightId++, RectF(d.rect), now)
         }
         val hold = prefs.holdMs.toLong()
-        highlights.removeAll { !highlight || now - it.lastSeen > hold }
-        return res.filter { it.cls != Detector.FEET_EXPOSED }.map { it.rect }
+        highlights.removeAll { !highlight || now - it.lastSeen > hold || it.rect.bottom < 0 || it.rect.top > vdH }
+        return DetectResult(
+            censor = res.filter { it.cls != Detector.FEET_EXPOSED && it.cls != Detector.FACE_FEMALE }.map { it.rect },
+            faces = res.filter { it.cls == Detector.FACE_FEMALE }.map { it.rect },
+        )
     }
 
     /** Copies the frame into the model tensor + a coarse luma grid. The Image is closed by the caller. */
@@ -322,7 +460,7 @@ class CaptureService : Service() {
     }
 
     /** Averages the current frame into a coarse mosaic (~7 blocks across the short side). */
-    private val sampler: (android.graphics.RectF) -> BoxTracker.Mosaic = { r ->
+    private val sampler: (RectF) -> BoxTracker.Mosaic = { r ->
         val x0 = r.left.toInt().coerceIn(0, vdW - 1)
         val y0 = r.top.toInt().coerceIn(0, vdH - 1)
         val x1 = r.right.toInt().coerceIn(x0 + 1, vdW)
@@ -355,30 +493,61 @@ class CaptureService : Service() {
         BoxTracker.Mosaic(colors, cols, rows)
     }
 
-    private fun pushOverlay() {
+    private fun toScreen(r: RectF, sx: Float, sy: Float) = Rect(
+        floor(r.left * sx).toInt(), floor(r.top * sy).toInt(),
+        ceil(r.right * sx).toInt(), ceil(r.bottom * sy).toInt(),
+    )
+
+    /**
+     * Shows the current state. While scrolling, boxes and checks are stretched in the
+     * scroll direction so they keep covering the content until the next check
+     * ("smear"), instead of lagging behind it.
+     */
+    private fun pushOverlay(frameNs: Long) {
         val sx = screenW.toFloat() / vdW
         val sy = screenH.toFloat() / vdH
+        val now = SystemClock.uptimeMillis()
+        val lagMs = ((System.nanoTime() - frameNs) / 1_000_000f).coerceIn(0f, 500f)
+        val interval = effectiveIntervalMs(now).toFloat()
+        val smear = velocity * CELL * (lagMs + interval + 40f) * 1.15f      // capture px
+        val predict = velocity * CELL * (lagMs + interval / 2f)
+
+        val shown = ArrayList<RectF>()
         val pixelate = prefs.pixelate
-        val map = HashMap<Int, OverlayManager.Visual>()
+        val boxes = HashMap<Int, OverlayManager.Visual>()
         for (b in tracker.boxes) {
-            val r = Rect(
-                floor(b.rect.left * sx).toInt(),
-                floor(b.rect.top * sy).toInt(),
-                ceil(b.rect.right * sx).toInt(),
-                ceil(b.rect.bottom * sy).toInt(),
-            )
+            val r = RectF(b.rect)
+            if (smear < 0f) r.top += smear else r.bottom += smear
+            r.top = max(r.top, 0f); r.bottom = min(r.bottom, vdH.toFloat())
+            if (r.height() < 1f) continue
+            shown += r
             val m = if (pixelate) b.mosaic else null
-            map[b.id] = OverlayManager.Visual(r, m?.colors, m?.cols ?: 0, m?.rows ?: 0)
+            boxes[b.id] = OverlayManager.Visual(toScreen(r, sx, sy), m?.colors, m?.cols ?: 0, m?.rows ?: 0)
         }
-        lastBoxCount = map.size
+        lastBoxCount = boxes.size
+
+        val guardRects = HashMap<Int, Rect>()
+        for (g in guards.guards) {
+            val r = guards.blockRect(g, vdW, vdH, smear)
+            if (r.isEmpty) { g.blockingSince = 0L; continue }
+            if (g.blockingSince == 0L) g.blockingSince = now
+            shown += r
+            guardRects[g.id] = toScreen(r, sx, sy)
+        }
+        lastGuardCount = guardRects.size
+
         val hl = HashMap<Int, Rect>()
-        for (h in highlights) {
-            hl[h.id] = Rect(
-                floor(h.rect.left * sx).toInt(), floor(h.rect.top * sy).toInt(),
-                ceil(h.rect.right * sx).toInt(), ceil(h.rect.bottom * sy).toInt(),
-            )
+        for (h in highlights) hl[h.id] = toScreen(RectF(h.rect).apply { offset(0f, predict) }, sx, sy)
+
+        shownRects = shown
+        val touchThrough = prefs.guardTouchThrough
+        main.post {
+            if (!stopped) {
+                overlay.applyBoxes(boxes)
+                overlay.applyGuards(guardRects, touchThrough)
+                overlay.applyHighlights(hl)
+            }
         }
-        main.post { if (!stopped) { overlay.apply(map); overlay.applyHighlights(hl) } }
     }
 
     private fun runOnMainAndWait(block: () -> Unit) {
@@ -476,6 +645,7 @@ class CaptureService : Service() {
         try { projection?.stop() } catch (_: Throwable) {}
         projection = null
         lastBoxCount = 0
+        lastGuardCount = 0
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         ToggleTileService.refresh(this)

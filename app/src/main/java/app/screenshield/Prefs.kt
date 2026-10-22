@@ -47,6 +47,26 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("highlight_feet", true)
         set(v) = sp.edit().putBoolean("highlight_feet", v).apply()
 
+    /** Minimum confidence (percent) for a bare-foot highlight; judged on the foot score alone. */
+    var feetThresholdPct: Int
+        get() = sp.getInt("feet_threshold", 18)
+        set(v) = sp.edit().putInt("feet_threshold", v.coerceIn(8, 60)).apply()
+
+    /** Block everything below a woman's face until that area has been checked. */
+    var preBlockFaces: Boolean
+        get() = sp.getBoolean("preblock_faces", true)
+        set(v) = sp.edit().putBoolean("preblock_faces", v).apply()
+
+    /** true: "censor check" blocks let touches through (max 80% opaque). false: solid, blocks touches. */
+    var guardTouchThrough: Boolean
+        get() = sp.getBoolean("guard_touch_through", true)
+        set(v) = sp.edit().putBoolean("guard_touch_through", v).apply()
+
+    /** Check up to 12x per second while the screen is scrolling. */
+    var boostWhileScrolling: Boolean
+        get() = sp.getBoolean("boost_scroll", true)
+        set(v) = sp.edit().putBoolean("boost_scroll", v).apply()
+
     var batteryPromptShown: Boolean
         get() = sp.getBoolean("battery_prompt", false)
         set(v) = sp.edit().putBoolean("battery_prompt", v).apply()
