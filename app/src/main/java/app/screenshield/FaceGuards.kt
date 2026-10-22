@@ -17,9 +17,11 @@ import android.graphics.RectF
  */
 class FaceGuards {
 
-    class Guard(val id: Int, var face: RectF, var analysedBottom: Float, var lastSeen: Long) {
+    class Guard(val id: Int, var face: RectF, var analysedBottom: Float, var lastSeen: Long, val createdAt: Long) {
         /** Since when part of this guard has been visible on screen and blocking. */
         var blockingSince: Long = 0L
+        /** false = new face: everything below it is blocked for the minimum time, then checked once. */
+        var initialCheckDone: Boolean = false
     }
 
     val guards = ArrayList<Guard>()
@@ -41,7 +43,7 @@ class FaceGuards {
      */
     fun blockRect(g: Guard, frameW: Int, frameH: Int, smear: Float = 0f): RectF {
         val r = region(g)
-        var top = maxOf(r.top, g.analysedBottom)
+        var top = if (g.initialCheckDone) maxOf(r.top, g.analysedBottom) else r.top
         var bottom = r.bottom
         if (top >= bottom) return RectF()
         if (smear < 0f) top += smear else bottom += smear
@@ -69,9 +71,9 @@ class FaceGuards {
             if (g != null) {
                 g.face = RectF(f); g.lastSeen = now; matched += g.id
             } else {
-                // Everything on screen right now was just analysed (no guard covered it yet),
-                // so only content that enters from below the screen edge needs blocking.
-                val ng = Guard(nextId++, RectF(f), frameH.toFloat(), now)
+                // New face: block everything below it until the minimum time has passed
+                // and the area has been checked once more.
+                val ng = Guard(nextId++, RectF(f), frameH.toFloat(), now, now)
                 guards += ng; matched += ng.id
             }
         }
@@ -79,19 +81,23 @@ class FaceGuards {
         while (it.hasNext()) {
             val g = it.next()
             val r = region(g)
-            val done = g.analysedBottom >= r.bottom
+            // Guards are kept (even when fully checked) as long as the face is around,
+            // so the same face doesn't trigger a new block every second.
             val gone = r.bottom <= 0f || r.top >= frameH
             val faceOnScreen = g.face.top >= 0f && g.face.bottom <= frameH
+            val missing = now - g.lastSeen
             val lost = g.id !in matched && faceOnScreen &&
-                (contentChanged || now - g.lastSeen > holdMs * 3)
-            if (done || gone || lost) it.remove()
+                ((contentChanged && missing > holdMs) || missing > maxOf(3000L, holdMs * 3))
+            if (gone || lost) it.remove()
         }
     }
 
     /** The guards were lifted and this frame was analysed: everything on screen is now checked. */
     fun markAnalysed(ids: Set<Int>, frameH: Int) {
-        for (g in guards) if (g.id in ids) g.analysedBottom = maxOf(g.analysedBottom, frameH.toFloat())
-        guards.removeAll { it.analysedBottom >= region(it).bottom }
+        for (g in guards) if (g.id in ids) {
+            g.analysedBottom = maxOf(g.analysedBottom, frameH.toFloat())
+            g.initialCheckDone = true
+        }
     }
 
     private fun overlap(a: RectF, b: RectF): Float {

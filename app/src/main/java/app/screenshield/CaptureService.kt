@@ -56,7 +56,7 @@ class CaptureService : Service() {
         private const val CHANNEL = "protection"
         private const val NOTIF_ID = 1
         private const val CELL = 4              // luma grid cell size in capture pixels
-        private const val FACE_THRESHOLD = 0.35f
+        private const val FACE_THRESHOLD = 0.25f
 
         @Volatile var instance: CaptureService? = null
             private set
@@ -286,11 +286,18 @@ class CaptureService : Service() {
         if (!prefs.preBlockFaces || guards.guards.isEmpty()) return
         if (now - lastGuardPeek < 250) return
         val speed = abs(velocity) * CELL * (screenH.toFloat() / vdH) * 1000f   // screen px/s
+        val minBlock = prefs.checkBlockMs.toLong()
         val ids = HashSet<Int>()
         for (g in guards.guards) {
             if (guards.blockRect(g, vdW, vdH).isEmpty) continue
-            val waited = g.blockingSince != 0L && now - g.blockingSince > 1200
-            if (speed < 250f || waited) ids += g.id
+            if (!g.initialCheckDone) {
+                // New face: always show the block for the minimum time, then check.
+                if (now - g.createdAt >= minBlock) ids += g.id
+            } else {
+                // Content scrolling in below an already-checked face.
+                val waited = g.blockingSince != 0L && now - g.blockingSince > 1200
+                if (speed < 250f || waited) ids += g.id
+            }
         }
         if (ids.isEmpty()) return
         lastGuardPeek = now
@@ -401,7 +408,10 @@ class CaptureService : Service() {
         val enabled = Detector.enabledClasses(prefs.coverMaleChest)
         val own = FloatArray(Detector.LABELS.size)
         if (highlight) own[Detector.FEET_EXPOSED] = prefs.feetThresholdPct / 100f
-        if (preBlock) own[Detector.FACE_FEMALE] = FACE_THRESHOLD
+        if (preBlock) {
+            own[Detector.FACE_FEMALE] = FACE_THRESHOLD
+            if (prefs.preBlockAllFaces) own[Detector.FACE_MALE] = FACE_THRESHOLD
+        }
         val res = det.detect(tensor, vdW, vdH, prefs.thresholdPct / 100f, enabled, own)
         lastInferMs = SystemClock.uptimeMillis() - t0
 
@@ -415,10 +425,12 @@ class CaptureService : Service() {
         val hold = prefs.holdMs.toLong()
         highlights.removeAll { !highlight || now - it.lastSeen > hold || it.rect.bottom < 0 || it.rect.top > vdH }
         return DetectResult(
-            censor = res.filter { it.cls != Detector.FEET_EXPOSED && it.cls != Detector.FACE_FEMALE }.map { it.rect },
-            faces = res.filter { it.cls == Detector.FACE_FEMALE }.map { it.rect },
+            censor = res.filter { it.cls != Detector.FEET_EXPOSED && !isFace(it.cls) }.map { it.rect },
+            faces = res.filter { isFace(it.cls) }.map { it.rect },
         )
     }
+
+    private fun isFace(c: Int) = c == Detector.FACE_FEMALE || c == Detector.FACE_MALE
 
     /** Copies the frame into the model tensor + a coarse luma grid. The Image is closed by the caller. */
     private fun readImage(img: Image): Boolean {

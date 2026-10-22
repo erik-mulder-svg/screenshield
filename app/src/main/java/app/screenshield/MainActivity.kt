@@ -134,8 +134,18 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, v -> prefs.preBlockFaces = v }
             setPadding(0, dp(12), 0, dp(4))
         })
-        note(root, "When a woman's face appears, anything below it that hasn't been analysed yet shows a " +
-            "\"Censor check…\" block. When you slow down or stop, it is checked, nudity is censored and the block disappears.")
+        note(root, "Every time a new face appears, everything below it shows a \"Censor check…\" block first. " +
+            "After the time below it is checked once more and the block disappears: you then see the picture, " +
+            "with any nudity censored. Content scrolling in later below that face is blocked until checked too.")
+        slider(root, "Show check block for", 2, 30, prefs.checkBlockMs / 100, { "%.1f s".format(it / 10f) }) {
+            prefs.checkBlockMs = it * 100
+        }
+        root.addView(Switch(this).apply {
+            text = "Also for men's faces"
+            isChecked = prefs.preBlockAllFaces
+            setOnCheckedChangeListener { _, v -> prefs.preBlockAllFaces = v }
+            setPadding(0, dp(8), 0, dp(8))
+        })
         val gGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
         val gThrough = RadioButton(this).apply { text = "Touch-through block (you can scroll on it)"; id = View.generateViewId() }
         val gSolid = RadioButton(this).apply { text = "Solid block (fully opaque, but blocks touches there)"; id = View.generateViewId() }

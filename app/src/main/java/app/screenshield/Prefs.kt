@@ -57,6 +57,16 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("preblock_faces", true)
         set(v) = sp.edit().putBoolean("preblock_faces", v).apply()
 
+    /** Minimum time (ms) a new face's "censor check" block stays up before it is checked and lifted. */
+    var checkBlockMs: Int
+        get() = sp.getInt("check_block_ms", 1000)
+        set(v) = sp.edit().putInt("check_block_ms", v.coerceIn(200, 5000)).apply()
+
+    /** Also pre-block below men's faces, not only women's. */
+    var preBlockAllFaces: Boolean
+        get() = sp.getBoolean("preblock_all_faces", false)
+        set(v) = sp.edit().putBoolean("preblock_all_faces", v).apply()
+
     /** true: "censor check" blocks let touches through (max 80% opaque). false: solid, blocks touches. */
     var guardTouchThrough: Boolean
         get() = sp.getBoolean("guard_touch_through", true)

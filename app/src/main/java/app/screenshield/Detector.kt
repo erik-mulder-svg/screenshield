@@ -143,5 +143,6 @@ class Detector(context: Context) : AutoCloseable {
 
         val FEET_EXPOSED = LABELS.indexOf("FEET_EXPOSED")
         val FACE_FEMALE = LABELS.indexOf("FACE_FEMALE")
+        val FACE_MALE = LABELS.indexOf("FACE_MALE")
     }
 }
